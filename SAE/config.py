@@ -117,7 +117,7 @@ class CacheActivationsRunnerConfig:
     dtype: torch.dtype = torch.float16
     num_inference_steps: int = 50
     seed: int = 42
-    batch_size: int = 100
+    batch_size: int = 10
     num_workers: int = 8
     output_or_diff: str = "output"
     max_num_examples: int | None = None
