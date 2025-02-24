@@ -20,9 +20,6 @@ from huggingface_hub import HfApi
 from tqdm import tqdm
 
 from SAE.config import CacheActivationsRunnerConfig
-# The following file should define lists:
-# class_available = [list of noun names]
-# theme_available = [list of style names, e.g. "watercolor", "3d_render", ...]
 from UnlearnCanvas_resources.const import class_available, theme_available
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -79,10 +76,8 @@ class CacheActivationsRunner:
             for line in chunk_lines:
                 if line.endswith("."):
                     line = line[:-1]
-                # Append a version for each style
                 for theme in theme_available:
                     chunk_prompts.append(f"{line} in {theme.replace('_', ' ')} style.")
-                # Also add the original prompt with a period
                 chunk_prompts.append(line + ".")
         random.shuffle(chunk_prompts)
         return chunk_prompts
@@ -170,7 +165,7 @@ class CacheActivationsRunner:
 
     @torch.no_grad()
     def run(self) -> dict[str, Dataset]:
-        # Assume each noun file has exactly 80 lines. With num_chunks=5, each chunk uses 16 lines.
+        # Assume each noun file has exactly 80 lines; with num_chunks=5, each chunk uses 16 lines.
         lines_per_file = 80
         lines_per_chunk = lines_per_file // self.cfg.num_chunks
 
@@ -187,7 +182,7 @@ class CacheActivationsRunner:
                     raise Exception(
                         f"Activations directory ({path}) is not empty. Please delete it or specify a different path."
                     )
-            # Create rolling buffer directories
+            # Create rolling buffer directories.
             rolling_buffer_paths = {}
             for hook, path in final_cached_activation_paths.items():
                 rb_path = path / "rolling_buffer"
@@ -198,18 +193,18 @@ class CacheActivationsRunner:
 
         self.accelerator.wait_for_everyone()
 
-        # Process each chunk (from chunk 0 to num_chunks-1)
+        # Process each chunk (chunk 0 to num_chunks-1)
         for chunk_idx in range(self.cfg.num_chunks):
             if self.accelerator.is_main_process:
                 print(f"\n=== Processing chunk {chunk_idx+1}/{self.cfg.num_chunks} ===")
 
-            # 1) Get prompts for this chunk (each file contributes lines [chunk_idx*16 : (chunk_idx+1)*16])
+            # 1) Get prompts for this chunk (each noun file contributes its designated lines)
             chunk_prompts = self._get_chunk_prompts(chunk_idx, lines_per_chunk)
 
-            # 2) Create batches for inference from this chunk
+            # 2) Create batches for inference
             batches = self.get_batches(chunk_prompts, self.cfg.batch_size)
 
-            # 3) Create a temporary subdirectory for this chunk's shards
+            # 3) Create temporary subdirectories for this chunk's shards
             tmp_chunk_paths = {
                 n: final_cached_activation_paths[n] / f"chunk_{chunk_idx:05d}" / ".tmp_shards"
                 for n in self.cfg.hook_names
@@ -219,7 +214,7 @@ class CacheActivationsRunner:
                     p.parent.mkdir(exist_ok=True, parents=True)
                     p.mkdir(exist_ok=True)
 
-            # 4) For each batch in this chunk, run inference and save shards
+            # 4) For each batch, run inference and save shards
             for i, batch_prompts in tqdm(
                 enumerate(batches),
                 desc=f"Caching chunk {chunk_idx+1}",
@@ -277,7 +272,7 @@ class CacheActivationsRunner:
                     print(f"Consolidated dataset for {hook_name}, chunk {chunk_idx+1}")
                     shutil.rmtree(chunk_dir / ".tmp_shards")
 
-            # 6) Update the rolling buffer by merging current chunk with previous data.
+            # 6) Update the rolling buffer by merging the current chunk with previous data.
             if self.accelerator.is_main_process:
                 from datasets import load_from_disk
                 for hook_name in self.cfg.hook_names:
@@ -286,15 +281,14 @@ class CacheActivationsRunner:
                     rb_path = rolling_buffer_paths[hook_name]
                     if any(rb_path.iterdir()):
                         rb_dataset = load_from_disk(str(rb_path))
-                        # Here we concatenate; you can change logic if you want to replace instead.
                         combined_dataset = concatenate_datasets([rb_dataset, current_dataset])
                     else:
                         combined_dataset = current_dataset
-                    # Optionally shuffle the combined dataset so that new and old are interleaved:
+                    # Optionally, shuffle the combined dataset.
                     combined_dataset = combined_dataset.shuffle(seed=42)
                     combined_dataset.save_to_disk(str(rb_path))
 
-            # 7) Train the SAE on the rolling buffer (i.e. on both old and current chunk activations)
+            # 7) Train the SAE on the rolling buffer (which now contains both old and current chunk activations)
             if self.accelerator.is_main_process:
                 print(f"=== Training SAE on rolling buffer after chunk {chunk_idx+1} ===")
                 from SAE.config import TrainConfig, SaeConfig
@@ -302,7 +296,7 @@ class CacheActivationsRunner:
 
                 dataset_dict = {}
                 for hook_name in self.cfg.hook_names:
-                    ds = Dataset.load_from_disk(str(rolling_buffer_paths[hook_name]))
+                    ds = load_from_disk(str(rolling_buffer_paths[hook_name]))
                     ds.set_format(
                         type="torch",
                         columns=["activations", "timestep"],
@@ -325,17 +319,27 @@ class CacheActivationsRunner:
                 trainer = SaeTrainer(train_cfg, dataset_dict)
                 trainer.fit()
 
-                # 8) Delete current chunk's data (keeping rolling buffer intact)
+                # 7b) After training on this chunk, push the SAE to Hugging Face Hub if configured.
+                if self.cfg.hf_repo_id is not None:
+                    print(f"Pushing SAE to Hugging Face Hub after chunk {chunk_idx+1}...")
+                    for hook_name, sae in trainer.saes.items():
+                        sae.push_to_hub(
+                            repo_id=f"{self.cfg.hf_repo_id}_{hook_name}",
+                            revision=self.cfg.hf_revision,
+                            private=self.cfg.hf_is_private_repo,
+                        )
+
+                # 8) Delete the current chunk's cached data (keeping the rolling buffer intact).
                 for hook_name, base_path in final_cached_activation_paths.items():
-                    chunk_dir = base_path / f"chunk_{chunk_idx:05d}"
+                    chunk_dir = f"{base_path}/chunk_{chunk_idx:05d}"
                     if chunk_dir.exists():
                         shutil.rmtree(chunk_dir)
                         print(f"Deleted chunk data for {hook_name}, chunk {chunk_idx+1}")
 
-        # End of chunk loop: return final rolling buffer datasets if needed.
+        # End of chunk loop.
+        from datasets import load_from_disk
         final_datasets = {}
         if self.accelerator.is_main_process:
-            from datasets import load_from_disk
             for hook_name, rb_path in rolling_buffer_paths.items():
                 final_datasets[hook_name] = load_from_disk(str(rb_path))
         return final_datasets
