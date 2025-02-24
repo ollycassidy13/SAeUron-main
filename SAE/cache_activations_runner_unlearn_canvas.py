@@ -1,6 +1,8 @@
 import io
 import json
+import math
 import os
+import random
 import shutil
 import sys
 from dataclasses import asdict
@@ -12,12 +14,15 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 import torch
 from accelerate import Accelerator
 from accelerate.utils import gather_object
-from datasets import Array2D, Dataset, Features, Value
+from datasets import Array2D, Dataset, Features, Value, concatenate_datasets
 from datasets.fingerprint import generate_fingerprint
 from huggingface_hub import HfApi
 from tqdm import tqdm
 
 from SAE.config import CacheActivationsRunnerConfig
+# The following file should define lists:
+# class_available = [list of noun names]
+# theme_available = [list of style names, e.g. "watercolor", "3d_render", ...]
 from UnlearnCanvas_resources.const import class_available, theme_available
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -34,11 +39,8 @@ class CacheActivationsRunner:
         self.cfg = cfg
         self.accelerator = Accelerator()
 
-        # hacky way to prevent initializing those objects when using only load_and_push_to_hub()
-        if self.cfg.hook_names is not None:
-            from SAE.hooked_sd_noised_pipeline import (
-                HookedStableDiffusionPipeline,
-            )
+        if self.cfg.hook_names:
+            from SAE.hooked_sd_noised_pipeline import HookedStableDiffusionPipeline
 
             self.pipe = HookedStableDiffusionPipeline.from_pretrained(
                 self.cfg.model_name, torch_dtype=self.cfg.dtype, safety_checker=None
@@ -51,112 +53,53 @@ class CacheActivationsRunner:
             self.pipe.set_progress_bar_config(disable=True)
 
             self.scheduler = self.pipe.scheduler
-
-            # Prepare timesteps
             self.scheduler.set_timesteps(self.cfg.num_inference_steps, device="cpu")
             self.scheduler_timesteps = self.scheduler.timesteps
 
-            self.features_dict = {hookpoint: None for hookpoint in self.cfg.hook_names}
+            self.features_dict = {hook: None for hook in self.cfg.hook_names}
 
-            all_prompts = []
-            for class_avail in class_available[
-                self.cfg.class_start : self.cfg.class_end
-            ]:
-                with open(
-                    os.path.join(
-                        "UnlearnCanvas_resources/anchor_prompts/finetune_prompts",
-                        f"sd_prompt_{class_avail}.txt",
-                    ),
-                    "r",
-                ) as prompt_file:
-                    if self.accelerator.is_main_process:
-                        print(f"Preparing prompts for class {class_avail}")
-                    for prompt in prompt_file:
-                        prompt = prompt.strip()
-                        prompt = prompt if not prompt.endswith(".") else prompt[:-1]
-                        for theme in theme_available:
-                            theme_prompt = (
-                                f"{prompt} in {theme.replace('_', ' ')} style."
-                            )
-                            all_prompts.append(theme_prompt)
-                        all_prompts.append(prompt + ".")
-
-            self.dataset = Dataset.from_dict({"caption": all_prompts})
-            self.dataset = self.dataset.shuffle(self.cfg.seed)
-            if limit := self.cfg.max_num_examples:
-                self.dataset = self.dataset.select(range(limit))
-
-            self.num_examples = len(self.dataset)
-            self.dataloader = self.get_batches(self.dataset, self.cfg.batch_size)
-            self.n_buffers = len(self.dataloader)
+    def _get_chunk_prompts(self, chunk_idx: int, lines_per_chunk: int) -> list[str]:
+        """
+        Reads the lines [chunk_idx*lines_per_chunk : (chunk_idx+1)*lines_per_chunk]
+        from each noun file, appends styles, and shuffles them within the chunk.
+        """
+        chunk_prompts = []
+        for noun in class_available[self.cfg.class_start : self.cfg.class_end]:
+            path = os.path.join(
+                "UnlearnCanvas_resources",
+                "anchor_prompts",
+                "finetune_prompts",
+                f"sd_prompt_{noun}.txt",
+            )
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines()]
+            start = chunk_idx * lines_per_chunk
+            end = start + lines_per_chunk
+            chunk_lines = lines[start:end]
+            for line in chunk_lines:
+                if line.endswith("."):
+                    line = line[:-1]
+                # Append a version for each style
+                for theme in theme_available:
+                    chunk_prompts.append(f"{line} in {theme.replace('_', ' ')} style.")
+                # Also add the original prompt with a period
+                chunk_prompts.append(line + ".")
+        random.shuffle(chunk_prompts)
+        return chunk_prompts
 
     @staticmethod
-    def get_batches(items, batch_size):
+    def get_batches(items: list[str], batch_size: int):
         num_batches = (len(items) + batch_size - 1) // batch_size
         batches = []
-
         for i in range(num_batches):
             start_index = i * batch_size
             end_index = min((i + 1) * batch_size, len(items))
-            batch = items[start_index:end_index]
-            batches.append(batch)
-
+            batches.append(items[start_index:end_index])
         return batches
 
     @staticmethod
-    def _consolidate_shards(
-        source_dir: Path, output_dir: Path, copy_files: bool = True
-    ) -> Dataset:
-        """Consolidate sharded datasets into a single directory without rewriting data.
-
-        Each of the shards must be of the same format, aka the full dataset must be able to
-        be recreated like so:
-
-        ```
-        ds = concatenate_datasets(
-            [Dataset.load_from_disk(str(shard_dir)) for shard_dir in sorted(source_dir.iterdir())]
-        )
-
-        ```
-
-        Sharded dataset format:
-        ```
-        source_dir/
-            shard_00000/
-                dataset_info.json
-                state.json
-                data-00000-of-00002.arrow
-                data-00001-of-00002.arrow
-            shard_00001/
-                dataset_info.json
-                state.json
-                data-00000-of-00001.arrow
-        ```
-
-        And flattens them into the format:
-
-        ```
-        output_dir/
-            dataset_info.json
-            state.json
-            data-00000-of-00003.arrow
-            data-00001-of-00003.arrow
-            data-00002-of-00003.arrow
-        ```
-
-        allowing the dataset to be loaded like so:
-
-        ```
-        ds = datasets.load_from_disk(output_dir)
-        ```
-
-        Args:
-            source_dir: Directory containing the sharded datasets
-            output_dir: Directory to consolidate the shards into
-            copy_files: If True, copy files; if False, move them and delete source_dir
-        """
-        first_shard_dir_name = "shard_00000"  # shard_{i:05d}
-
+    def _consolidate_shards(source_dir: Path, output_dir: Path, copy_files: bool = True) -> Dataset:
+        first_shard_dir_name = "shard_00000"
         assert source_dir.exists() and source_dir.is_dir()
         assert (
             output_dir.exists()
@@ -165,25 +108,17 @@ class CacheActivationsRunner:
         )
         if not (source_dir / first_shard_dir_name).exists():
             raise Exception(f"No shards in {source_dir} exist!")
-
         transfer_fn = shutil.copy2 if copy_files else shutil.move
-
-        # Move dataset_info.json from any shard (all the same)
         transfer_fn(
             source_dir / first_shard_dir_name / "dataset_info.json",
             output_dir / "dataset_info.json",
         )
-
         arrow_files = []
         file_count = 0
-
         for shard_dir in sorted(source_dir.iterdir()):
             if not shard_dir.name.startswith("shard_"):
                 continue
-
-            # state.json contains arrow filenames
             state = json.loads((shard_dir / "state.json").read_text())
-
             for data_file in state["_data_files"]:
                 src = shard_dir / data_file["filename"]
                 new_name = f"data-{file_count:05d}-of-{len(list(source_dir.iterdir())):05d}.arrow"
@@ -191,235 +126,223 @@ class CacheActivationsRunner:
                 transfer_fn(src, dst)
                 arrow_files.append({"filename": new_name})
                 file_count += 1
-
         new_state = {
             "_data_files": arrow_files,
-            "_fingerprint": None,  # temporary
+            "_fingerprint": None,
             "_format_columns": None,
             "_format_kwargs": {},
             "_format_type": None,
             "_output_all_columns": False,
             "_split": None,
         }
-
-        # fingerprint is generated from dataset.__getstate__ (not including _fingerprint)
         with open(output_dir / "state.json", "w") as f:
             json.dump(new_state, f, indent=2)
-
         ds = Dataset.load_from_disk(str(output_dir))
         fingerprint = generate_fingerprint(ds)
         del ds
-
         with open(output_dir / "state.json", "r+") as f:
             state = json.loads(f.read())
             state["_fingerprint"] = fingerprint
             f.seek(0)
             json.dump(state, f, indent=2)
             f.truncate()
-
-        if not copy_files:  # cleanup source dir
+        if not copy_files:
             shutil.rmtree(source_dir)
-
         return Dataset.load_from_disk(output_dir)
 
     @torch.no_grad()
-    def _create_shard(
-        self,
-        buffer: torch.Tensor,  # buffer shape: "bs num_inference_steps+1 d_sample_size d_in",
-        hook_name: str,
-    ) -> Dataset:
+    def _create_shard(self, buffer: torch.Tensor, hook_name: str) -> Dataset:
         batch_size, n_steps, d_sample_size, d_in = buffer.shape
-
-        # Filter buffer based on every N steps
         buffer = buffer[:, :: self.cfg.cache_every_n_timesteps, :, :]
-
         activations = buffer.reshape(-1, d_sample_size, d_in)
-        timesteps = self.scheduler_timesteps[
-            :: self.cfg.cache_every_n_timesteps
-        ].repeat(batch_size)
-
+        timesteps = self.scheduler_timesteps[:: self.cfg.cache_every_n_timesteps].repeat(batch_size)
         shard = Dataset.from_dict(
-            {
-                "activations": activations,
-                "timestep": timesteps,
-            },
+            {"activations": activations, "timestep": timesteps},
             features=self.features_dict[hook_name],
         )
         return shard
 
-    def create_dataset_feature(self, hook_name, d_in, d_out):
-        self.features_dict[hook_name] = Features(
-            {
-                "activations": Array2D(
-                    shape=(
-                        d_in,
-                        d_out,
-                    ),
-                    dtype=TORCH_STRING_DTYPE_MAP[self.cfg.dtype],
-                ),
-                "timestep": Value(dtype="uint16"),
-            }
-        )
+    def create_dataset_feature(self, hook_name: str, d_in: int, d_out: int):
+        self.features_dict[hook_name] = Features({
+            "activations": Array2D(shape=(d_in, d_out), dtype=TORCH_STRING_DTYPE_MAP[self.cfg.dtype]),
+            "timestep": Value(dtype="uint16"),
+        })
 
     @torch.no_grad()
     def run(self) -> dict[str, Dataset]:
-        ### Paths setup
-        assert self.cfg.new_cached_activations_path is not None
+        # Assume each noun file has exactly 80 lines. With num_chunks=5, each chunk uses 16 lines.
+        lines_per_file = 80
+        lines_per_chunk = lines_per_file // self.cfg.num_chunks
 
+        # Setup final directories for each hook.
+        assert self.cfg.new_cached_activations_path is not None
         final_cached_activation_paths = {
             n: Path(os.path.join(self.cfg.new_cached_activations_path, n))
             for n in self.cfg.hook_names
         }
-
         if self.accelerator.is_main_process:
             for path in final_cached_activation_paths.values():
                 path.mkdir(exist_ok=True, parents=True)
                 if any(path.iterdir()):
                     raise Exception(
-                        f"Activations directory ({path}) is not empty. Please delete it or specify a different path. Exiting the script to prevent accidental deletion of files."
+                        f"Activations directory ({path}) is not empty. Please delete it or specify a different path."
                     )
-
-            tmp_cached_activation_paths = {
-                n: path / ".tmp_shards/"
-                for n, path in final_cached_activation_paths.items()
-            }
-            for path in tmp_cached_activation_paths.values():
-                path.mkdir(exist_ok=False, parents=False)
+            # Create rolling buffer directories
+            rolling_buffer_paths = {}
+            for hook, path in final_cached_activation_paths.items():
+                rb_path = path / "rolling_buffer"
+                rb_path.mkdir(exist_ok=True, parents=True)
+                rolling_buffer_paths[hook] = rb_path
+        else:
+            rolling_buffer_paths = {}
 
         self.accelerator.wait_for_everyone()
 
-        ### Create temporary sharded datasets
-        if self.accelerator.is_main_process:
-            print(f"Started caching {self.num_examples} activations")
-
-        for i, batch in tqdm(
-            enumerate(self.dataloader),
-            desc="Caching activations",
-            total=self.n_buffers,
-            disable=not self.accelerator.is_main_process,
-        ):
-            # breakpoint()
-            with self.accelerator.split_between_processes(batch) as prompt:
-                prompt = prompt[self.cfg.column]
-                _, acts_cache = self.pipe.run_with_cache(
-                    prompt=prompt,
-                    output_type="latent",
-                    num_inference_steps=self.cfg.num_inference_steps,
-                    save_input=True if self.cfg.output_or_diff == "diff" else False,
-                    save_output=True,
-                    positions_to_cache=self.cfg.hook_names,
-                    guidance_scale=self.cfg.guidance_scale,
-                )
-
-            # breakpoint()
-
-            self.accelerator.wait_for_everyone()
-
-            # Gather and process each hook's activations separately
-            gathered_buffer = {}
-            for hook_name in self.cfg.hook_names:
-                if self.cfg.output_or_diff == "diff":
-                    gathered_buffer[hook_name] = (
-                        acts_cache["output"][hook_name] - acts_cache["input"][hook_name]
-                    )
-                else:
-                    gathered_buffer[hook_name] = acts_cache["output"][hook_name]
-            gathered_buffer = gather_object([gathered_buffer])  # list of dicts
-
+        # Process each chunk (from chunk 0 to num_chunks-1)
+        for chunk_idx in range(self.cfg.num_chunks):
             if self.accelerator.is_main_process:
+                print(f"\n=== Processing chunk {chunk_idx+1}/{self.cfg.num_chunks} ===")
+
+            # 1) Get prompts for this chunk (each file contributes lines [chunk_idx*16 : (chunk_idx+1)*16])
+            chunk_prompts = self._get_chunk_prompts(chunk_idx, lines_per_chunk)
+
+            # 2) Create batches for inference from this chunk
+            batches = self.get_batches(chunk_prompts, self.cfg.batch_size)
+
+            # 3) Create a temporary subdirectory for this chunk's shards
+            tmp_chunk_paths = {
+                n: final_cached_activation_paths[n] / f"chunk_{chunk_idx:05d}" / ".tmp_shards"
+                for n in self.cfg.hook_names
+            }
+            if self.accelerator.is_main_process:
+                for p in tmp_chunk_paths.values():
+                    p.parent.mkdir(exist_ok=True, parents=True)
+                    p.mkdir(exist_ok=True)
+
+            # 4) For each batch in this chunk, run inference and save shards
+            for i, batch_prompts in tqdm(
+                enumerate(batches),
+                desc=f"Caching chunk {chunk_idx+1}",
+                total=len(batches),
+                disable=not self.accelerator.is_main_process
+            ):
+                with self.accelerator.split_between_processes(batch_prompts) as local_prompts:
+                    _, acts_cache = self.pipe.run_with_cache(
+                        prompt=local_prompts,
+                        output_type="latent",
+                        num_inference_steps=self.cfg.num_inference_steps,
+                        save_input=True if self.cfg.output_or_diff == "diff" else False,
+                        save_output=True,
+                        positions_to_cache=self.cfg.hook_names,
+                        guidance_scale=self.cfg.guidance_scale,
+                    )
+                self.accelerator.wait_for_everyone()
+
+                gathered_buffer = {}
                 for hook_name in self.cfg.hook_names:
-                    gathered_buffer_acts = torch.cat(
-                        [
-                            gathered_buffer[i][hook_name]
-                            for i in range(len(gathered_buffer))
-                        ],
-                        dim=0,
-                    )
-                    if self.features_dict[hook_name] is None:
-                        self.create_dataset_feature(
-                            hook_name,
-                            gathered_buffer_acts.shape[-2],
-                            gathered_buffer_acts.shape[-1],
+                    if self.cfg.output_or_diff == "diff":
+                        gathered_buffer[hook_name] = (
+                            acts_cache["output"][hook_name] - acts_cache["input"][hook_name]
                         )
+                    else:
+                        gathered_buffer[hook_name] = acts_cache["output"][hook_name]
+                gathered_buffer = gather_object([gathered_buffer])
+                if self.accelerator.is_main_process:
+                    for hook_name in self.cfg.hook_names:
+                        gathered_acts = torch.cat(
+                            [g[hook_name] for g in gathered_buffer],
+                            dim=0
+                        )
+                        if self.features_dict[hook_name] is None:
+                            self.create_dataset_feature(
+                                hook_name,
+                                gathered_acts.shape[-2],
+                                gathered_acts.shape[-1],
+                            )
+                        shard = self._create_shard(gathered_acts, hook_name)
+                        shard.save_to_disk(
+                            f"{tmp_chunk_paths[hook_name]}/shard_{i:05d}",
+                            num_shards=1,
+                        )
+                        del gathered_acts, shard
+                    del gathered_buffer
 
-                    print(f"{hook_name=} {gathered_buffer_acts.shape=}")
-
-                    shard = self._create_shard(gathered_buffer_acts, hook_name)
-
-                    shard.save_to_disk(
-                        f"{tmp_cached_activation_paths[hook_name]}/shard_{i:05d}",
-                        num_shards=1,
+            # 5) Consolidate the chunk's shards into a single dataset
+            if self.accelerator.is_main_process:
+                for hook_name, base_path in final_cached_activation_paths.items():
+                    chunk_dir = base_path / f"chunk_{chunk_idx:05d}"
+                    consolidated = self._consolidate_shards(
+                        chunk_dir / ".tmp_shards", chunk_dir, copy_files=False
                     )
-                    del gathered_buffer_acts, shard
-                del gathered_buffer
+                    print(f"Consolidated dataset for {hook_name}, chunk {chunk_idx+1}")
+                    shutil.rmtree(chunk_dir / ".tmp_shards")
 
-        ### Concat sharded datasets together, shuffle and push to hub
-        datasets = {}
+            # 6) Update the rolling buffer by merging current chunk with previous data.
+            if self.accelerator.is_main_process:
+                from datasets import load_from_disk
+                for hook_name in self.cfg.hook_names:
+                    chunk_dir = final_cached_activation_paths[hook_name] / f"chunk_{chunk_idx:05d}"
+                    current_dataset = load_from_disk(str(chunk_dir))
+                    rb_path = rolling_buffer_paths[hook_name]
+                    if any(rb_path.iterdir()):
+                        rb_dataset = load_from_disk(str(rb_path))
+                        # Here we concatenate; you can change logic if you want to replace instead.
+                        combined_dataset = concatenate_datasets([rb_dataset, current_dataset])
+                    else:
+                        combined_dataset = current_dataset
+                    # Optionally shuffle the combined dataset so that new and old are interleaved:
+                    combined_dataset = combined_dataset.shuffle(seed=42)
+                    combined_dataset.save_to_disk(str(rb_path))
 
-        if self.accelerator.is_main_process:
-            for hook_name, path in tmp_cached_activation_paths.items():
-                datasets[hook_name] = self._consolidate_shards(
-                    path, final_cached_activation_paths[hook_name], copy_files=False
-                )
-                print(f"Consolidated the dataset for hook {hook_name}")
+            # 7) Train the SAE on the rolling buffer (i.e. on both old and current chunk activations)
+            if self.accelerator.is_main_process:
+                print(f"=== Training SAE on rolling buffer after chunk {chunk_idx+1} ===")
+                from SAE.config import TrainConfig, SaeConfig
+                from SAE.trainer import SaeTrainer
 
-            if self.cfg.hf_repo_id:
-                print("Pushing to hub...")
-                for hook_name, dataset in datasets.items():
-                    dataset.push_to_hub(
-                        repo_id=f"{self.cfg.hf_repo_id}_{hook_name}",
-                        num_shards=self.cfg.hf_num_shards or self.n_buffers,
-                        private=self.cfg.hf_is_private_repo,
-                        revision=self.cfg.hf_revision,
+                dataset_dict = {}
+                for hook_name in self.cfg.hook_names:
+                    ds = Dataset.load_from_disk(str(rolling_buffer_paths[hook_name]))
+                    ds.set_format(
+                        type="torch",
+                        columns=["activations", "timestep"],
+                        dtype=torch.float32,
                     )
+                    dataset_dict[hook_name] = ds
 
-                meta_io = io.BytesIO()
-                meta_contents = json.dumps(
-                    asdict(self.cfg), indent=2, ensure_ascii=False
-                ).encode("utf-8")
-                meta_io.write(meta_contents)
-                meta_io.seek(0)
-
-                api = HfApi()
-                api.upload_file(
-                    path_or_fileobj=meta_io,
-                    path_in_repo="cache_activations_runner_cfg.json",
-                    repo_id=self.cfg.hf_repo_id,
-                    repo_type="dataset",
-                    commit_message="Add cache_activations_runner metadata",
+                train_cfg = TrainConfig(
+                    sae=SaeConfig(),
+                    dataset_path=[str(rolling_buffer_paths[h]) for h in self.cfg.hook_names],
+                    effective_batch_size=4096,
+                    num_workers=1,
+                    grad_acc_steps=1,
+                    micro_acc_steps=1,
+                    lr=2e-4,
+                    hookpoints=self.cfg.hook_names,
                 )
+                print("Training configuration:", train_cfg)
 
-        return datasets
+                trainer = SaeTrainer(train_cfg, dataset_dict)
+                trainer.fit()
 
-    def load_and_push_to_hub(self) -> None:
-        """Load dataset from disk and push it to the hub."""
-        assert self.cfg.new_cached_activations_path is not None
-        dataset = Dataset.load_from_disk(self.cfg.new_cached_activations_path)
+                # 8) Delete current chunk's data (keeping rolling buffer intact)
+                for hook_name, base_path in final_cached_activation_paths.items():
+                    chunk_dir = base_path / f"chunk_{chunk_idx:05d}"
+                    if chunk_dir.exists():
+                        shutil.rmtree(chunk_dir)
+                        print(f"Deleted chunk data for {hook_name}, chunk {chunk_idx+1}")
+
+        # End of chunk loop: return final rolling buffer datasets if needed.
+        final_datasets = {}
         if self.accelerator.is_main_process:
-            print("Loaded dataset from disk")
+            from datasets import load_from_disk
+            for hook_name, rb_path in rolling_buffer_paths.items():
+                final_datasets[hook_name] = load_from_disk(str(rb_path))
+        return final_datasets
 
-            if self.cfg.hf_repo_id:
-                print("Pushing to hub...")
-                dataset.push_to_hub(
-                    repo_id=self.cfg.hf_repo_id,
-                    num_shards=self.cfg.hf_num_shards
-                    or (len(dataset) // self.cfg.batch_size),
-                    private=self.cfg.hf_is_private_repo,
-                    revision=self.cfg.hf_revision,
-                )
 
-                meta_io = io.BytesIO()
-                meta_contents = json.dumps(
-                    asdict(self.cfg), indent=2, ensure_ascii=False
-                ).encode("utf-8")
-                meta_io.write(meta_contents)
-                meta_io.seek(0)
-
-                api = HfApi()
-                api.upload_file(
-                    path_or_fileobj=meta_io,
-                    path_in_repo="cache_activations_runner_cfg.json",
-                    repo_id=self.cfg.hf_repo_id,
-                    repo_type="dataset",
-                    commit_message="Add cache_activations_runner metadata",
-                )
+def load_and_push_to_hub() -> None:
+    from SAE.config import CacheActivationsRunnerConfig
+    cfg = CacheActivationsRunnerConfig()
+    runner = CacheActivationsRunner(cfg)
+    runner.run()
